@@ -164,8 +164,10 @@ class AudioDiffusion:
 class AudioDiffusionPipeline(DiffusionPipeline):
 
     def __init__(self, unet: UNet2DConditionModel,
-                 scheduler: Union[DDIMScheduler, DDPMScheduler]):
+                 scheduler: Union[DDIMScheduler, DDPMScheduler],
+                 progress_bar: Iterable = tqdm):
         super().__init__()
+        self.progress_bar = progress_bar or (lambda _: _)
         self.register_modules(unet=unet, scheduler=scheduler)
 
     @torch.no_grad()
