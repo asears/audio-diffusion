@@ -3,32 +3,25 @@
 import argparse
 import os
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from datasets import load_from_disk, load_dataset
-from diffusers import (DiffusionPipeline, DDPMScheduler, UNet2DModel,
-                       DDIMScheduler, AutoencoderKL)
-from diffusers.modeling_utils import EntryNotFoundError
+from datasets import load_dataset, load_from_disk
+from diffusers import (AutoencoderKL, DDIMScheduler, DDPMScheduler,
+                       DiffusionPipeline, UNet2DModel)
 from diffusers.hub_utils import init_git_repo, push_to_hub
+from diffusers.modeling_utils import EntryNotFoundError
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
-from torchvision.transforms import (
-    CenterCrop,
-    Compose,
-    InterpolationMode,
-    Normalize,
-    Resize,
-    ToTensor,
-)
-import numpy as np
-from tqdm.auto import tqdm
 from librosa.util import normalize
+from torchvision.transforms import (CenterCrop, Compose, InterpolationMode,
+                                    Normalize, Resize, ToTensor)
+from tqdm.auto import tqdm
 
+from audiodiffusion import AudioDiffusionPipeline, LatentAudioDiffusionPipeline
 from audiodiffusion.mel import Mel
-from audiodiffusion import LatentAudioDiffusionPipeline, AudioDiffusionPipeline
 
 logger = get_logger(__name__)
 
@@ -45,8 +38,7 @@ def main(args):
 
     if args.dataset_name is not None:
         if os.path.exists(args.dataset_name):
-            dataset = load_from_disk(args.dataset_name,
-                                     args.dataset_config_name)["train"]
+            dataset = load_from_disk(args.dataset_name, args.dataset_config_name)["train"]
         else:
             dataset = load_dataset(
                 args.dataset_name,
@@ -63,58 +55,49 @@ def main(args):
             split="train",
         )
     # Determine image resolution
-    resolution = dataset[0]['image'].height, dataset[0]['image'].width
+    resolution = dataset[0]["image"].height, dataset[0]["image"].width
 
-    augmentations = Compose([
-        ToTensor(),
-        Normalize([0.5], [0.5]),
-    ])
+    augmentations = Compose(
+        [
+            ToTensor(),
+            Normalize([0.5], [0.5]),
+        ]
+    )
 
     def transforms(examples):
-        if args.vae is not None and vqvae.config['in_channels'] == 3:
-            images = [
-                augmentations(image.convert('RGB'))
-                for image in examples["image"]
-            ]
+        if args.vae is not None and vqvae.config["in_channels"] == 3:
+            images = [augmentations(image.convert("RGB")) for image in examples["image"]]
         else:
             images = [augmentations(image) for image in examples["image"]]
         return {"input": images}
 
     dataset.set_transform(transforms)
-    train_dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.train_batch_size, shuffle=True)
+    train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.train_batch_size, shuffle=True)
 
     vqvae = None
     if args.vae is not None:
         try:
             vqvae = AutoencoderKL.from_pretrained(args.vae)
         except EnvironmentError:
-            vqvae = LatentAudioDiffusionPipeline.from_pretrained(
-                args.vae).vqvae
+            vqvae = LatentAudioDiffusionPipeline.from_pretrained(args.vae).vqvae
         # Determine latent resolution
         with torch.no_grad():
-            latent_resolution = vqvae.encode(
-                torch.zeros((1, 1) +
-                            resolution)).latent_dist.sample().shape[2:]
+            latent_resolution = vqvae.encode(torch.zeros((1, 1) + resolution)).latent_dist.sample().shape[2:]
 
     if args.from_pretrained is not None:
-        pipeline = {
-            'LatentAudioDiffusionPipeline': LatentAudioDiffusionPipeline,
-            'AudioDiffusionPipeline': AudioDiffusionPipeline
-        }.get(
-            DiffusionPipeline.get_config_dict(
-                args.from_pretrained)['_class_name'], AudioDiffusionPipeline)
+        pipeline = {"LatentAudioDiffusionPipeline": LatentAudioDiffusionPipeline, "AudioDiffusionPipeline": AudioDiffusionPipeline,}.get(
+            DiffusionPipeline.get_config_dict(args.from_pretrained)["_class_name"],
+            AudioDiffusionPipeline,
+        )
         pipeline = pipeline.from_pretrained(args.from_pretrained)
         model = pipeline.unet
-        if hasattr(pipeline, 'vqvae'):
+        if hasattr(pipeline, "vqvae"):
             vqvae = pipeline.vqvae
     else:
         model = UNet2DModel(
             sample_size=resolution if vqvae is None else latent_resolution,
-            in_channels=1
-            if vqvae is None else vqvae.config['latent_channels'],
-            out_channels=1
-            if vqvae is None else vqvae.config['latent_channels'],
+            in_channels=1 if vqvae is None else vqvae.config["latent_channels"],
+            out_channels=1 if vqvae is None else vqvae.config["latent_channels"],
             layers_per_block=2,
             block_out_channels=(128, 128, 256, 256, 512, 512),
             down_block_types=(
@@ -136,11 +119,9 @@ def main(args):
         )
 
     if args.scheduler == "ddpm":
-        noise_scheduler = DDPMScheduler(
-            num_train_timesteps=args.num_train_steps)
+        noise_scheduler = DDPMScheduler(num_train_timesteps=args.num_train_steps)
     else:
-        noise_scheduler = DDIMScheduler(
-            num_train_timesteps=args.num_train_steps)
+        noise_scheduler = DDIMScheduler(num_train_timesteps=args.num_train_steps)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -154,12 +135,10 @@ def main(args):
         args.lr_scheduler,
         optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps,
-        num_training_steps=(len(train_dataloader) * args.num_epochs) //
-        args.gradient_accumulation_steps,
+        num_training_steps=(len(train_dataloader) * args.num_epochs) // args.gradient_accumulation_steps,
     )
 
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler)
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, lr_scheduler)
 
     ema_model = EMAModel(
         getattr(model, "module", model),
@@ -175,14 +154,11 @@ def main(args):
         run = os.path.split(__file__)[-1].split(".")[0]
         accelerator.init_trackers(run)
 
-    mel = Mel(x_res=resolution[1],
-              y_res=resolution[0],
-              hop_length=args.hop_length)
+    mel = Mel(x_res=resolution[1], y_res=resolution[0], hop_length=args.hop_length)
 
     global_step = 0
     for epoch in range(args.num_epochs):
-        progress_bar = tqdm(total=len(train_dataloader),
-                            disable=not accelerator.is_local_main_process)
+        progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
 
         if epoch < args.start_epoch:
@@ -202,8 +178,7 @@ def main(args):
             if vqvae is not None:
                 vqvae.to(clean_images.device)
                 with torch.no_grad():
-                    clean_images = vqvae.encode(
-                        clean_images).latent_dist.sample()
+                    clean_images = vqvae.encode(clean_images).latent_dist.sample()
                 # Scale latent images to ensure approximately unit variance
                 clean_images = clean_images * 0.18215
 
@@ -214,14 +189,13 @@ def main(args):
             timesteps = torch.randint(
                 0,
                 noise_scheduler.num_train_timesteps,
-                (bsz, ),
+                (bsz,),
                 device=clean_images.device,
             ).long()
 
             # Add noise to the clean images according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
-            noisy_images = noise_scheduler.add_noise(clean_images, noise,
-                                                     timesteps)
+            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
@@ -255,21 +229,16 @@ def main(args):
 
         # Generate sample images for visual inspection
         if accelerator.is_main_process:
-            if (
-                    epoch + 1
-            ) % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
+            if (epoch + 1) % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
                 if vqvae is not None:
                     pipeline = LatentAudioDiffusionPipeline(
-                        unet=accelerator.unwrap_model(
-                            ema_model.averaged_model if args.use_ema else model
-                        ),
+                        unet=accelerator.unwrap_model(ema_model.averaged_model if args.use_ema else model),
                         vqvae=vqvae,
-                        scheduler=noise_scheduler)
+                        scheduler=noise_scheduler,
+                    )
                 else:
                     pipeline = AudioDiffusionPipeline(
-                        unet=accelerator.unwrap_model(
-                            ema_model.averaged_model if args.use_ema else model
-                        ),
+                        unet=accelerator.unwrap_model(ema_model.averaged_model if args.use_ema else model),
                         scheduler=noise_scheduler,
                     )
 
@@ -298,13 +267,10 @@ def main(args):
                 )
 
                 # denormalize the images and save to tensorboard
-                images = np.array([
-                    np.frombuffer(image.tobytes(), dtype="uint8").reshape(
-                        (len(image.getbands()), image.height, image.width))
-                    for image in images
-                ])
-                accelerator.trackers[0].writer.add_images(
-                    "test_samples", images, epoch)
+                images = np.array(
+                    [np.frombuffer(image.tobytes(), dtype="uint8").reshape((len(image.getbands()), image.height, image.width)) for image in images]
+                )
+                accelerator.trackers[0].writer.add_images("test_samples", images, epoch)
                 for _, audio in enumerate(audios):
                     accelerator.trackers[0].writer.add_audio(
                         f"test_audio_{_}",
@@ -318,8 +284,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Simple example of a training script.")
+    parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--dataset_name", type=str, default=None)
     parser.add_argument("--dataset_config_name", type=str, default=None)
@@ -360,23 +325,19 @@ if __name__ == "__main__":
         type=str,
         default="no",
         choices=["no", "fp16", "bf16"],
-        help=(
-            "Whether to use mixed precision. Choose"
-            "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
-            "and an Nvidia Ampere GPU."),
+        help=("Whether to use mixed precision. Choose" "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10." "and an Nvidia Ampere GPU."),
     )
     parser.add_argument("--hop_length", type=int, default=512)
     parser.add_argument("--from_pretrained", type=str, default=None)
     parser.add_argument("--start_epoch", type=int, default=0)
     parser.add_argument("--num_train_steps", type=int, default=1000)
-    parser.add_argument("--scheduler",
-                        type=str,
-                        default="ddpm",
-                        help="ddpm or ddim")
-    parser.add_argument("--vae",
-                        type=str,
-                        default=None,
-                        help="pretrained VAE model for latent diffusion")
+    parser.add_argument("--scheduler", type=str, default="ddpm", help="ddpm or ddim")
+    parser.add_argument(
+        "--vae",
+        type=str,
+        default=None,
+        help="pretrained VAE model for latent diffusion",
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -384,11 +345,8 @@ if __name__ == "__main__":
         args.local_rank = env_local_rank
 
     if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError(
-            "You must specify either a dataset name from the hub or a train data directory."
-        )
+        raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
     if args.dataset_name is not None and args.dataset_name == args.hub_model_id:
-        raise ValueError(
-            "The local dataset name must be different from the hub model id.")
+        raise ValueError("The local dataset name must be different from the hub model id.")
 
     main(args)
